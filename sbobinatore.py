@@ -150,7 +150,6 @@ class SettingsWindow(ctk.CTkToplevel):
         )
         self.provider_menu.pack(anchor="w", padx=16, pady=(0, 12))
 
-        # Riga Gemini + Pulsante Link
         key_header = ctk.CTkFrame(frame, fg_color="transparent")
         key_header.pack(fill="x", padx=16)
         ctk.CTkLabel(
@@ -175,14 +174,12 @@ class SettingsWindow(ctk.CTkToplevel):
         self.gemini_entry.insert(0, config.get("gemini_key", ""))
         self.gemini_entry.pack(anchor="w", padx=16, pady=(6, 12))
 
-        # Modello
         ctk.CTkLabel(
             frame, text="Nome modello AI:", font=ctk.CTkFont(size=12, weight="bold")
         ).pack(anchor="w", padx=16)
         self.model_entry = ctk.CTkEntry(frame, width=260)
         self.model_entry.pack(anchor="w", padx=16, pady=(4, 12))
 
-        # Aspetto
         ctk.CTkLabel(
             frame, text="Tema grafico:", font=ctk.CTkFont(size=12, weight="bold")
         ).pack(anchor="w", padx=16, pady=(2, 0))
@@ -309,7 +306,6 @@ class SbobinaFacileApp(ctk.CTk):
             command=self._open_settings,
         ).pack(side="right", pady=4)
 
-        # Card 1: Selezione File
         card_file = ctk.CTkFrame(self, corner_radius=14)
         card_file.pack(fill="x", padx=22, pady=6)
 
@@ -358,7 +354,6 @@ class SbobinaFacileApp(ctk.CTk):
         )
         self.btn_txt_only.pack(side="right")
 
-        # Card 2: Opzioni
         card_opts = ctk.CTkFrame(self, corner_radius=14)
         card_opts.pack(fill="x", padx=22, pady=6)
 
@@ -398,7 +393,6 @@ class SbobinaFacileApp(ctk.CTk):
             self.summary_switch.select()
         self.summary_switch.pack(pady=(16, 0))
 
-        # Azione & Progresso
         action_frame = ctk.CTkFrame(self, fg_color="transparent")
         action_frame.pack(fill="x", padx=22, pady=(8, 4))
 
@@ -441,7 +435,6 @@ class SbobinaFacileApp(ctk.CTk):
         )
         self.status_label.pack(anchor="w")
 
-        # Risultati
         self.tabs = ctk.CTkTabview(self, corner_radius=14)
         self.tabs.pack(fill="both", expand=True, padx=22, pady=(4, 16))
 
