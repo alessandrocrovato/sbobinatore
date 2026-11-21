@@ -29,12 +29,31 @@ jobs:
 
       - name: Scarica motore AI locale Vulkan (llama.cpp)
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $rel = Invoke-RestMethod "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-          $asset = $rel.assets | Where-Object { $_.name -like "*bin-win-vulkan-x64.zip" } | Select-Object -First 1
-          if (-not $asset) {
-            $asset = $rel.assets | Where-Object { $_.name -like "*bin-win-cpu-x64.zip" } | Select-Object -First 1
+          $headers = @{
+            "Authorization" = "Bearer $env:GITHUB_TOKEN"
+            "User-Agent"    = "GitHubActions"
           }
+          $releases = Invoke-RestMethod "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=15" -Headers $headers
+          $asset = $null
+          foreach ($r in $releases) {
+            $asset = $r.assets | Where-Object { $_.name -like "*win*vulkan*.zip" -and $_.name -notlike "*arm64*" } | Select-Object -First 1
+            if ($asset) { break }
+          }
+          if (-not $asset) {
+            foreach ($r in $releases) {
+              $asset = $r.assets | Where-Object { ($_.name -like "*win*cpu*.zip" -or $_.name -like "*win*avx2*.zip") -and $_.name -notlike "*arm64*" } | Select-Object -First 1
+              if ($asset) { break }
+            }
+          }
+          if (-not $asset) {
+            Write-Host "File trovati nell'ultima release:"
+            $releases[0].assets | ForEach-Object { Write-Host $_.name }
+            throw "Nessun binario Windows trovato nelle ultime 15 release."
+          }
+          Write-Host "Scarico: $($asset.name)"
           Invoke-WebRequest $asset.browser_download_url -OutFile llama.zip
           Expand-Archive llama.zip -DestinationPath "dist\SbobinaFacile\llama_bin" -Force
 
