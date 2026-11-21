@@ -4,6 +4,9 @@ import json
 import time
 import queue
 import socket
+import shutil
+import ctypes
+import zipfile
 import itertools
 import threading
 import subprocess
@@ -12,23 +15,11 @@ import requests
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
-# Aggiunge le DLL CUDA di NVIDIA incluse nel pacchetto prima di importare faster_whisper
-if getattr(sys, "frozen", False):
-    _base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
-    for _sub in (
-        os.path.join(_base, "nvidia", "cublas", "bin"),
-        os.path.join(_base, "nvidia", "cudnn", "bin"),
-    ):
-        if os.path.isdir(_sub):
-            os.add_dll_directory(_sub)
-            os.environ["PATH"] = _sub + os.pathsep + os.environ.get("PATH", "")
-
 if sys.stdout is None:
     sys.stdout = open(os.devnull, "w", encoding="utf-8")
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
-from faster_whisper import WhisperModel
 from huggingface_hub import hf_hub_download
 
 if getattr(sys, "frozen", False):
@@ -44,6 +35,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 MODELS_DIR = os.path.join(DATA_DIR, "models")
+CUDA_LIBS_DIR = os.path.join(DATA_DIR, "cuda_libs")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 LOCAL_LLM_REPO = "Qwen/Qwen2.5-3B-Instruct-GGUF"
@@ -56,6 +48,7 @@ DEFAULT_CONFIG = {
     "quality": "Bilanciata",
     "language": "Italiano",
     "appearance": "Sistema",
+    "skip_cuda_download": False,
 }
 
 QUALITY_MAP = {
@@ -72,6 +65,145 @@ LANG_MAP = {
     "Tedesco": "de",
     "Rileva da solo": "auto",
 }
+
+
+def register_cuda_dll_dir():
+    if os.path.isdir(CUDA_LIBS_DIR):
+        try:
+            os.add_dll_directory(CUDA_LIBS_DIR)
+        except Exception:
+            pass
+        if CUDA_LIBS_DIR not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = CUDA_LIBS_DIR + os.pathsep + os.environ.get("PATH", "")
+
+
+register_cuda_dll_dir()
+
+
+def has_nvidia_gpu() -> bool:
+    smi_paths = [
+        shutil.which("nvidia-smi"),
+        r"C:\Windows\System32\nvidia-smi.exe",
+        r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+    ]
+    for p in smi_paths:
+        if p and os.path.isfile(p):
+            return True
+    try:
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        out = subprocess.check_output(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_VideoController).Name -join ';'",
+            ],
+            creationflags=creation_flags,
+            timeout=5,
+            text=True,
+        )
+        return "nvidia" in out.lower()
+    except Exception:
+        return False
+
+
+def cuda_libs_available() -> bool:
+    has_cublas = os.path.isfile(os.path.join(CUDA_LIBS_DIR, "cublas64_12.dll"))
+    has_cudnn = any(
+        os.path.isfile(os.path.join(CUDA_LIBS_DIR, name))
+        for name in ("cudnn_ops64_9.dll", "cudnn64_9.dll", "cudnn64_8.dll")
+    )
+    if has_cublas and has_cudnn:
+        return True
+
+    try:
+        ctypes.WinDLL("cublas64_12.dll")
+        for cdn in ("cudnn_ops64_9.dll", "cudnn64_9.dll", "cudnn64_8.dll"):
+            try:
+                ctypes.WinDLL(cdn)
+                return True
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return False
+
+
+def get_pypi_wheel_url(package_name: str, prefer_major: str | None = None) -> tuple[str, str]:
+    r = requests.get(f"https://pypi.org/pypi/{package_name}/json", timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    urls = data.get("urls", [])
+
+    if prefer_major and not data.get("info", {}).get("version", "").startswith(prefer_major):
+        matching_vers = [
+            v
+            for v in data.get("releases", {}).keys()
+            if v.startswith(prefer_major) and "a" not in v and "b" not in v and "rc" not in v
+        ]
+        if matching_vers:
+            def ver_key(v):
+                return tuple(int(x) for x in v.split(".") if x.isdigit())
+
+            best_ver = max(matching_vers, key=ver_key)
+            urls = data["releases"][best_ver]
+
+    for item in urls:
+        fname = item.get("filename", "")
+        if item.get("packagetype") == "bdist_wheel" and "win_amd64" in fname:
+            return item["url"], fname
+    raise RuntimeError(f"Pacchetto Windows non trovato su PyPI per {package_name}")
+
+
+def download_file_resumable(url: str, dest_path: str, progress_cb=None, max_retries: int = 6):
+    temp_path = dest_path + ".part"
+    for attempt in range(1, max_retries + 1):
+        try:
+            existing = os.path.getsize(temp_path) if os.path.isfile(temp_path) else 0
+            headers = {"Range": f"bytes={existing}-"} if existing > 0 else {}
+            with requests.get(url, headers=headers, stream=True, timeout=(15, 60)) as r:
+                if r.status_code == 416:
+                    break
+                if existing > 0 and r.status_code == 200:
+                    existing = 0
+                    mode = "wb"
+                elif r.status_code in (200, 206):
+                    mode = "ab" if r.status_code == 206 else "wb"
+                else:
+                    r.raise_for_status()
+
+                total = int(r.headers.get("Content-Length", 0)) + existing
+                downloaded = existing
+                with open(temp_path, mode) as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 256):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if progress_cb and total > 0:
+                                progress_cb(downloaded, total)
+            break
+        except Exception:
+            if attempt == max_retries:
+                raise
+            time.sleep(min(10, attempt * 2))
+
+    if os.path.isfile(temp_path):
+        os.replace(temp_path, dest_path)
+
+
+def hf_download_with_retry(repo_id: str, filename: str, local_dir: str, max_retries: int = 6) -> str:
+    for attempt in range(1, max_retries + 1):
+        try:
+            return hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                local_dir=local_dir,
+            )
+        except Exception:
+            if attempt == max_retries:
+                raise
+            time.sleep(min(12, attempt * 2))
+    raise RuntimeError("Download interrotto.")
 
 
 def load_config() -> dict:
@@ -144,7 +276,7 @@ class SettingsWindow(ctk.CTkToplevel):
         self.title(
             "Benvenuto! Configurazione Iniziale" if first_run else "Impostazioni AI e Aspetto"
         )
-        self.geometry("510x540" if first_run else "510x455")
+        self.geometry("510x580" if first_run else "510x495")
         self.resizable(False, False)
         self.config = config
         self.on_save = on_save
@@ -226,7 +358,16 @@ class SettingsWindow(ctk.CTkToplevel):
             frame,
             values=["Sistema", "Chiaro", "Scuro"],
             variable=self.theme_var,
-        ).pack(anchor="w", padx=16, pady=(4, 16))
+        ).pack(anchor="w", padx=16, pady=(4, 12))
+
+        self.cuda_switch = ctk.CTkSwitch(
+            frame,
+            text="Usa accelerazione GPU NVIDIA (se presente nel PC)",
+            font=ctk.CTkFont(size=12),
+        )
+        if not config.get("skip_cuda_download", False):
+            self.cuda_switch.select()
+        self.cuda_switch.pack(anchor="w", padx=16, pady=(2, 12))
 
         ctk.CTkButton(
             frame,
@@ -274,6 +415,7 @@ class SettingsWindow(ctk.CTkToplevel):
         if "Gemini" in provider and self.model_entry.get().strip():
             self.config["gemini_model"] = self.model_entry.get().strip()
         self.config["appearance"] = self.theme_var.get()
+        self.config["skip_cuda_download"] = not bool(self.cuda_switch.get())
 
         save_config(self.config)
         self.on_save()
@@ -326,598 +468,3 @@ class SbobinaFacileApp(ctk.CTk):
         title_box = ctk.CTkFrame(header, fg_color="transparent")
         title_box.pack(side="left")
         ctk.CTkLabel(
-            title_box,
-            text="🎙️ SbobinaFacile AI",
-            font=ctk.CTkFont(size=24, weight="bold"),
-        ).pack(anchor="w")
-        ctk.CTkLabel(
-            title_box,
-            text="Trasforma file audio e video lunghi in testo chiaro e riassunti automatici",
-            font=ctk.CTkFont(size=13),
-            text_color="gray",
-        ).pack(anchor="w")
-
-        ctk.CTkButton(
-            header,
-            text="⚙️ Impostazioni",
-            width=130,
-            height=34,
-            fg_color=("gray82", "gray25"),
-            text_color=("gray10", "gray90"),
-            hover_color=("gray75", "gray35"),
-            command=self._open_settings,
-        ).pack(side="right", pady=4)
-
-        card_file = ctk.CTkFrame(self, corner_radius=14)
-        card_file.pack(fill="x", padx=22, pady=6)
-
-        row_file = ctk.CTkFrame(card_file, fg_color="transparent")
-        row_file.pack(fill="x", padx=16, pady=14)
-
-        self.btn_pick = ctk.CTkButton(
-            row_file,
-            text="📁  Scegli File Audio o Video",
-            height=44,
-            width=230,
-            font=ctk.CTkFont(size=14, weight="bold"),
-            command=self._pick_file,
-        )
-        self.btn_pick.pack(side="left")
-
-        info_col = ctk.CTkFrame(row_file, fg_color="transparent")
-        info_col.pack(side="left", fill="x", expand=True, padx=(16, 8))
-
-        self.file_name_label = ctk.CTkLabel(
-            info_col,
-            text="Nessun file selezionato",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            anchor="w",
-        )
-        self.file_name_label.pack(anchor="w")
-
-        self.file_size_label = ctk.CTkLabel(
-            info_col,
-            text="Supporta MP3, MP4, MKV, WAV, M4A, MOV (anche oltre 400 MB)",
-            font=ctk.CTkFont(size=12),
-            text_color="gray",
-            anchor="w",
-        )
-        self.file_size_label.pack(anchor="w")
-
-        self.btn_txt_only = ctk.CTkButton(
-            row_file,
-            text="📝 Riassumi un .txt",
-            height=34,
-            width=140,
-            fg_color="transparent",
-            border_width=1,
-            text_color=("gray20", "gray85"),
-            command=self._pick_and_summarize_txt,
-        )
-        self.btn_txt_only.pack(side="right")
-
-        card_opts = ctk.CTkFrame(self, corner_radius=14)
-        card_opts.pack(fill="x", padx=22, pady=6)
-
-        opts_inner = ctk.CTkFrame(card_opts, fg_color="transparent")
-        opts_inner.pack(fill="x", padx=16, pady=12)
-
-        q_box = ctk.CTkFrame(opts_inner, fg_color="transparent")
-        q_box.pack(side="left", padx=(0, 24))
-        ctk.CTkLabel(
-            q_box, text="Precisione trascrizione:", font=ctk.CTkFont(size=12, weight="bold")
-        ).pack(anchor="w", pady=(0, 4))
-        self.quality_seg = ctk.CTkSegmentedButton(
-            q_box, values=["Veloce", "Bilanciata", "Massima"]
-        )
-        self.quality_seg.set(self.config_data.get("quality", "Bilanciata"))
-        self.quality_seg.pack(anchor="w")
-
-        l_box = ctk.CTkFrame(opts_inner, fg_color="transparent")
-        l_box.pack(side="left", padx=(0, 24))
-        ctk.CTkLabel(
-            l_box, text="Lingua parlata:", font=ctk.CTkFont(size=12, weight="bold")
-        ).pack(anchor="w", pady=(0, 4))
-        self.lang_menu = ctk.CTkOptionMenu(
-            l_box, values=list(LANG_MAP.keys()), width=140
-        )
-        self.lang_menu.set(self.config_data.get("language", "Italiano"))
-        self.lang_menu.pack(anchor="w")
-
-        s_box = ctk.CTkFrame(opts_inner, fg_color="transparent")
-        s_box.pack(side="right")
-        self.summary_switch = ctk.CTkSwitch(
-            s_box,
-            text="Crea anche il riassunto AI",
-            font=ctk.CTkFont(size=13, weight="bold"),
-        )
-        if "Disattivato" not in self.config_data.get("ai_provider", ""):
-            self.summary_switch.select()
-        self.summary_switch.pack(pady=(16, 0))
-
-        action_frame = ctk.CTkFrame(self, fg_color="transparent")
-        action_frame.pack(fill="x", padx=22, pady=(8, 4))
-
-        btn_row = ctk.CTkFrame(action_frame, fg_color="transparent")
-        btn_row.pack(fill="x")
-
-        self.btn_start = ctk.CTkButton(
-            btn_row,
-            text="▶   AVVIA ELABORAZIONE",
-            height=46,
-            font=ctk.CTkFont(size=15, weight="bold"),
-            fg_color="#1f8b4c",
-            hover_color="#176d3b",
-            command=self._start_full,
-        )
-        self.btn_start.pack(side="left", fill="x", expand=True)
-
-        self.btn_stop = ctk.CTkButton(
-            btn_row,
-            text="⏹ Ferma",
-            height=46,
-            width=110,
-            font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color="#b83b3b",
-            hover_color="#8f2b2b",
-            state="disabled",
-            command=self._request_stop,
-        )
-        self.btn_stop.pack(side="right", padx=(10, 0))
-
-        self.progress_bar = ctk.CTkProgressBar(action_frame, height=12, corner_radius=6)
-        self.progress_bar.set(0.0)
-        self.progress_bar.pack(fill="x", pady=(10, 4))
-
-        self.status_label = ctk.CTkLabel(
-            action_frame,
-            text="Pronto. Seleziona un file per iniziare.",
-            font=ctk.CTkFont(size=13),
-            text_color="gray",
-        )
-        self.status_label.pack(anchor="w")
-
-        self.tabs = ctk.CTkTabview(self, corner_radius=14)
-        self.tabs.pack(fill="both", expand=True, padx=22, pady=(4, 16))
-
-        tab_sum = self.tabs.add("✨ Riassunto")
-        tab_tr = self.tabs.add("📝 Trascrizione Completa")
-
-        sum_bar = ctk.CTkFrame(tab_sum, fg_color="transparent")
-        sum_bar.pack(fill="x", pady=(0, 6))
-        ctk.CTkButton(
-            sum_bar, text="📋 Copia Riassunto", width=150, height=30,
-            command=lambda: self._copy_text(self.summary_box),
-        ).pack(side="left")
-        self.btn_open_folder_1 = ctk.CTkButton(
-            sum_bar, text="📂 Apri cartella dei file", width=170, height=30,
-            fg_color=("gray80", "gray28"), text_color=("gray10", "gray90"),
-            state="disabled", command=self._open_output_folder,
-        )
-        self.btn_open_folder_1.pack(side="right")
-
-        self.summary_box = ctk.CTkTextbox(tab_sum, wrap="word", font=ctk.CTkFont(size=14))
-        self.summary_box.pack(fill="both", expand=True)
-
-        tr_bar = ctk.CTkFrame(tab_tr, fg_color="transparent")
-        tr_bar.pack(fill="x", pady=(0, 6))
-        ctk.CTkButton(
-            tr_bar, text="📋 Copia Trascrizione", width=160, height=30,
-            command=lambda: self._copy_text(self.transcript_box),
-        ).pack(side="left")
-        self.btn_open_folder_2 = ctk.CTkButton(
-            tr_bar, text="📂 Apri cartella dei file", width=170, height=30,
-            fg_color=("gray80", "gray28"), text_color=("gray10", "gray90"),
-            state="disabled", command=self._open_output_folder,
-        )
-        self.btn_open_folder_2.pack(side="right")
-
-        self.transcript_box = ctk.CTkTextbox(tab_tr, wrap="word", font=ctk.CTkFont(size=13))
-        self.transcript_box.pack(fill="both", expand=True)
-
-    def _open_settings(self):
-        SettingsWindow(self, self.config_data, self._on_settings_saved, first_run=False)
-
-    def _on_settings_saved(self):
-        self._apply_theme(self.config_data.get("appearance", "Sistema"))
-        if "Disattivato" in self.config_data.get("ai_provider", ""):
-            self.summary_switch.deselect()
-        else:
-            self.summary_switch.select()
-
-    def _pick_file(self):
-        path = filedialog.askopenfilename(
-            title="Seleziona file audio o video",
-            filetypes=[
-                ("Audio e Video", "*.mp3 *.mp4 *.mkv *.wav *.m4a *.mov *.webm *.ogg *.flac *.avi"),
-                ("Tutti i file", "*.*"),
-            ],
-        )
-        if path:
-            self.selected_file = path
-            name = os.path.basename(path)
-            size_mb = os.path.getsize(path) / (1024 * 1024)
-            self.file_name_label.configure(text=name)
-            self.file_size_label.configure(text=f"Dimensione: {size_mb:.1f} MB — Pronto per essere elaborato")
-
-    def _copy_text(self, textbox: ctk.CTkTextbox):
-        content = textbox.get("1.0", "end-1c").strip()
-        if not content:
-            messagebox.showinfo("Vuoto", "Non c'è ancora nessun testo da copiare.")
-            return
-        self.clipboard_clear()
-        self.clipboard_append(content)
-        self.update()
-        self.status_label.configure(text="✅ Testo copiato negli appunti! Ora puoi incollarlo dove vuoi.")
-
-    def _open_output_folder(self):
-        if self.last_output_dir and os.path.isdir(self.last_output_dir):
-            os.startfile(self.last_output_dir)
-
-    def _set_busy(self, busy: bool):
-        state = "disabled" if busy else "normal"
-        self.btn_start.configure(state=state)
-        self.btn_pick.configure(state=state)
-        self.btn_txt_only.configure(state=state)
-        self.btn_stop.configure(state="normal" if busy else "disabled")
-
-    def _request_stop(self):
-        self.stop_requested = True
-        self.status_label.configure(text="Interruzione in corso, salvo ciò che è stato fatto finora...")
-
-    def _check_ai_ready(self) -> bool:
-        provider = self.config_data.get("ai_provider", "")
-        if "Gemini" in provider and not self.config_data.get("gemini_key", "").strip():
-            SettingsWindow(self, self.config_data, self._on_settings_saved, first_run=True)
-            return False
-        return True
-
-    def _start_full(self):
-        if not self.selected_file or not os.path.isfile(self.selected_file):
-            messagebox.showwarning("Nessun file", "Clicca prima su 'Scegli File Audio o Video'.")
-            return
-
-        do_summary = bool(self.summary_switch.get()) and "Disattivato" not in self.config_data.get("ai_provider", "")
-        if do_summary and not self._check_ai_ready():
-            return
-
-        self.config_data["quality"] = self.quality_seg.get()
-        self.config_data["language"] = self.lang_menu.get()
-        save_config(self.config_data)
-
-        self.transcript_box.delete("1.0", "end")
-        self.summary_box.delete("1.0", "end")
-        self.progress_bar.set(0.0)
-        self.stop_requested = False
-        self.last_output_dir = os.path.dirname(self.selected_file)
-        self._set_busy(True)
-        self.tabs.set("📝 Trascrizione Completa")
-
-        threading.Thread(
-            target=self._worker_full,
-            args=(self.selected_file, do_summary),
-            daemon=True,
-        ).start()
-
-    def _pick_and_summarize_txt(self):
-        if "Disattivato" in self.config_data.get("ai_provider", ""):
-            messagebox.showinfo("AI disattivata", "Attiva Gemini o AI Locale nelle Impostazioni per i riassunti.")
-            return
-        if not self._check_ai_ready():
-            return
-
-        txt_path = filedialog.askopenfilename(
-            title="Scegli un file di testo (.txt) da riassumere",
-            filetypes=[("File di testo", "*.txt"), ("Tutti i file", "*.*")],
-        )
-        if not txt_path:
-            return
-
-        self.summary_box.delete("1.0", "end")
-        self.progress_bar.set(0.0)
-        self.stop_requested = False
-        self.last_output_dir = os.path.dirname(txt_path)
-        self._set_busy(True)
-        self.tabs.set("✨ Riassunto")
-
-        threading.Thread(
-            target=self._worker_txt_only,
-            args=(txt_path,),
-            daemon=True,
-        ).start()
-
-    def _start_whisper_with_fallback(self, file_path: str, model_size: str, lang: str | None):
-        # Prova prima con GPU NVIDIA (CUDA) fino al primo segmento reale
-        try:
-            self.ui_queue.put(("status", "Avvio motore vocale (provo accelerazione GPU NVIDIA)..."))
-            model = WhisperModel(
-                model_size, device="cuda", compute_type="float16", download_root=MODELS_DIR
-            )
-            segments, info = model.transcribe(
-                file_path,
-                language=lang,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
-            )
-            seg_iter = iter(segments)
-            first_seg = next(seg_iter, None)
-            return "🚀 GPU NVIDIA", info, first_seg, seg_iter
-        except Exception:
-            self.ui_queue.put(("status", "Avvio motore vocale su processore (CPU)..."))
-            model = WhisperModel(
-                model_size, device="cpu", compute_type="int8", download_root=MODELS_DIR
-            )
-            segments, info = model.transcribe(
-                file_path,
-                language=lang,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
-            )
-            seg_iter = iter(segments)
-            first_seg = next(seg_iter, None)
-            return "💻 CPU", info, first_seg, seg_iter
-
-    def _worker_full(self, file_path: str, do_summary: bool):
-        try:
-            model_size = QUALITY_MAP.get(self.quality_seg.get(), "medium")
-            lang_code = LANG_MAP.get(self.lang_menu.get(), "it")
-            lang = None if lang_code == "auto" else lang_code
-
-            self.ui_queue.put(("status", "Preparazione del motore vocale (al primo avvio scarica il modello)..."))
-            hw_label, info, first_seg, seg_iter = self._start_whisper_with_fallback(
-                file_path, model_size, lang
-            )
-
-            all_segs = itertools.chain([first_seg], seg_iter) if first_seg is not None else []
-            total_dur = info.duration or 1.0
-            base_path = os.path.splitext(file_path)[0]
-            txt_path = f"{base_path}_trascrizione.txt"
-            parts = []
-            t_start = time.time()
-
-            with open(txt_path, "w", encoding="utf-8") as f:
-                for seg in all_segs:
-                    if self.stop_requested:
-                        break
-                    line = f"[{format_timestamp(seg.start)}] {seg.text.strip()}\n"
-                    f.write(line)
-                    f.flush()
-                    parts.append(line)
-
-                    ratio = min(0.99, seg.end / total_dur)
-                    eta_txt = ""
-                    if ratio > 0.02:
-                        elapsed = time.time() - t_start
-                        eta_sec = (elapsed / ratio) - elapsed
-                        eta_txt = f" — Rimasti {format_eta(eta_sec)}"
-
-                    self.ui_queue.put(("transcript", line))
-                    self.ui_queue.put(("progress", ratio))
-                    self.ui_queue.put((
-                        "status",
-                        f"[{hw_label}] Trascrizione: {ratio*100:.0f}% ({format_timestamp(seg.end)} / {format_timestamp(total_dur)}){eta_txt}",
-                    ))
-
-            self.ui_queue.put(("enable_folder", None))
-
-            if self.stop_requested:
-                self.ui_queue.put(("status", f"Fermato. La parte già trascritta è salvata in {os.path.basename(txt_path)}"))
-                return
-
-            self.ui_queue.put(("progress", 1.0))
-
-            if do_summary and parts:
-                self._run_summary("".join(parts), base_path)
-            else:
-                self.ui_queue.put(("status", f"✅ Completato ({hw_label})! File salvato nella stessa cartella."))
-
-        except Exception as e:
-            self.ui_queue.put(("error", self._humanize_error(e)))
-        finally:
-            self.ui_queue.put(("done", None))
-
-    def _worker_txt_only(self, txt_path: str):
-        try:
-            with open(txt_path, "r", encoding="utf-8") as f:
-                text = f.read()
-            base_path = os.path.splitext(txt_path)[0]
-            self.ui_queue.put(("enable_folder", None))
-            self._run_summary(text, base_path)
-        except Exception as e:
-            self.ui_queue.put(("error", self._humanize_error(e)))
-        finally:
-            self.ui_queue.put(("done", None))
-
-    def _ensure_local_llm(self) -> int:
-        server_exe = find_llama_server()
-        if not server_exe:
-            raise RuntimeError("Motore AI locale (llama-server.exe) non trovato nel pacchetto.")
-
-        model_path = os.path.join(MODELS_DIR, LOCAL_LLM_FILE)
-        if not os.path.isfile(model_path):
-            self.ui_queue.put(("status", "Primo avvio offline: scarico il modello AI locale (~2 GB), attendi..."))
-            model_path = hf_hub_download(
-                repo_id=LOCAL_LLM_REPO,
-                filename=LOCAL_LLM_FILE,
-                local_dir=MODELS_DIR,
-            )
-
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        # Prova prima con GPU Vulkan (-ngl 99), se fallisce passa a solo CPU (-ngl 0)
-        for ngl in (99, 0):
-            port = get_free_port()
-            cmd = [
-                server_exe,
-                "-m", model_path,
-                "--host", "127.0.0.1",
-                "--port", str(port),
-                "-c", "8192",
-                "-ngl", str(ngl),
-            ]
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=creation_flags,
-            )
-            self.llama_proc = proc
-
-            ready = False
-            for _ in range(60):
-                if proc.poll() is not None:
-                    break
-                try:
-                    r = requests.get(f"http://127.0.0.1:{port}/health", timeout=1)
-                    if r.status_code == 200:
-                        ready = True
-                        break
-                except Exception:
-                    pass
-                time.sleep(0.5)
-
-            if ready:
-                mode = "GPU Vulkan" if ngl > 0 else "CPU"
-                self.ui_queue.put(("status", f"AI locale pronta ({mode}). Generazione riassunto in corso..."))
-                return port
-
-            self._stop_local_llm()
-
-        raise RuntimeError("Impossibile avviare il motore AI locale integrato.")
-
-    def _stop_local_llm(self):
-        if self.llama_proc is not None:
-            try:
-                self.llama_proc.terminate()
-                self.llama_proc.wait(timeout=5)
-            except Exception:
-                try:
-                    self.llama_proc.kill()
-                except Exception:
-                    pass
-            self.llama_proc = None
-
-    def _call_ai(self, prompt: str, local_port: int | None = None) -> str:
-        provider = self.config_data.get("ai_provider", "")
-        if "Locale" in provider:
-            url = f"http://127.0.0.1:{local_port}/v1/chat/completions"
-            payload = {
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-            }
-            resp = requests.post(url, json=payload, timeout=300)
-            if resp.status_code != 200:
-                raise RuntimeError(f"Errore AI locale ({resp.status_code}): {resp.text}")
-            return resp.json()["choices"][0]["message"]["content"].strip()
-
-        elif "Gemini" in provider:
-            model = self.config_data.get("gemini_model", "gemini-2.5-flash")
-            key = self.config_data.get("gemini_key", "").strip()
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-            resp = requests.post(
-                url,
-                json={"contents": [{"parts": [{"text": prompt}]}]},
-                timeout=180,
-            )
-            if resp.status_code != 200:
-                raise RuntimeError(f"Errore Gemini ({resp.status_code}): {resp.text}")
-            return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-        return ""
-
-    def _run_summary(self, full_text: str, base_path: str):
-        provider = self.config_data.get("ai_provider", "")
-        self.ui_queue.put(("status", "Preparazione del riassunto AI..."))
-        self.ui_queue.put(("switch_tab", "✨ Riassunto"))
-
-        local_port = None
-        try:
-            if "Locale" in provider:
-                local_port = self._ensure_local_llm()
-
-            max_chars = 350000 if "Gemini" in provider else 10000
-            chunks = chunk_text(full_text, max_chars=max_chars)
-
-            if len(chunks) == 1:
-                prompt = (
-                    "Analizza questa trascrizione in italiano e scrivi un riassunto chiaro, ordinato e facile da leggere "
-                    "(usa titoli in maiuscolo e semplici elenchi con il simbolo •, evita codici markdown complessi).\n"
-                    "Includi:\n"
-                    "1. SINTESI GENERALE\n"
-                    "2. PUNTI CHIAVE E ARGOMENTI TRATTATI\n"
-                    "3. CONCLUSIONI O DECISIONI IMPORTANTI\n\n"
-                    f"TRASCRIZIONE:\n{chunks[0]}"
-                )
-                final_summary = self._call_ai(prompt, local_port)
-            else:
-                partials = []
-                for idx, ch in enumerate(chunks, start=1):
-                    if self.stop_requested:
-                        return
-                    self.ui_queue.put(("status", f"Riassumo la parte {idx} di {len(chunks)}..."))
-                    self.ui_queue.put(("progress", idx / (len(chunks) + 1)))
-                    p = (
-                        f"Riassumi in modo fedele e completo questa parte ({idx}/{len(chunks)}) "
-                        f"di una lunga trascrizione in italiano, mantenendo nomi e concetti chiave:\n\n{ch}"
-                    )
-                    partials.append(self._call_ai(p, local_port))
-
-                self.ui_queue.put(("status", "Unisco tutto nel riassunto finale..."))
-                combined = "\n\n---\n\n".join(partials)
-                final_prompt = (
-                    "Unisci questi riassunti parziali in un unico riassunto finale ordinato e facile da leggere in italiano "
-                    "(usa titoli in maiuscolo ed elenchi con •):\n"
-                    "1. SINTESI GENERALE\n"
-                    "2. PUNTI CHIAVE PER ARGOMENTO\n"
-                    "3. CONCLUSIONI\n\n"
-                    f"{combined}"
-                )
-                final_summary = self._call_ai(final_prompt, local_port)
-
-            summary_path = f"{base_path}_riassunto.txt"
-            with open(summary_path, "w", encoding="utf-8") as f:
-                f.write(final_summary)
-
-            self.ui_queue.put(("progress", 1.0))
-            self.ui_queue.put(("summary", final_summary))
-            self.ui_queue.put(("status", "✅ Tutto pronto! Trascrizione e riassunto salvati nella cartella del file."))
-        finally:
-            self._stop_local_llm()
-
-    def _humanize_error(self, err: Exception) -> str:
-        msg = str(err)
-        if "API_KEY_INVALID" in msg or "400" in msg or "403" in msg:
-            return "La chiave API di Google Gemini sembra non valida. Controllala cliccando su ⚙️ Impostazioni."
-        return f"Si è verificato un imprevisto:\n{msg}"
-
-    def _process_queue(self):
-        try:
-            while True:
-                kind, payload = self.ui_queue.get_nowait()
-                if kind == "transcript":
-                    self.transcript_box.insert("end", payload)
-                    self.transcript_box.see("end")
-                elif kind == "summary":
-                    self.summary_box.delete("1.0", "end")
-                    self.summary_box.insert("1.0", payload)
-                elif kind == "progress":
-                    self.progress_bar.set(payload)
-                elif kind == "status":
-                    self.status_label.configure(text=payload)
-                elif kind == "switch_tab":
-                    self.tabs.set(payload)
-                elif kind == "enable_folder":
-                    self.btn_open_folder_1.configure(state="normal")
-                    self.btn_open_folder_2.configure(state="normal")
-                elif kind == "error":
-                    self.status_label.configure(text="❌ Operazione interrotta per un errore.")
-                    messagebox.showerror("Attenzione", payload)
-                elif kind == "done":
-                    self._set_busy(False)
-        except queue.Empty:
-            pass
-        self.after(100, self._process_queue)
-
-
-if __name__ == "__main__":
-    app = SbobinaFacileApp()
-    app.mainloop()
