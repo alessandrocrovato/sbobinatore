@@ -18,14 +18,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Installa dipendenze, librerie GPU NVIDIA e PyInstaller
+      - name: Installa dipendenze e PyInstaller
         run: |
           python -m pip install --upgrade pip
-          pip install faster-whisper requests customtkinter pyinstaller certifi nvidia-cublas-cu12 nvidia-cudnn-cu12
+          pip install faster-whisper requests customtkinter pyinstaller certifi
 
       - name: Compila eseguibile con PyInstaller
         run: |
-          pyinstaller --noconsole --onedir --name SbobinaFacile --collect-all customtkinter --collect-all faster_whisper --collect-all ctranslate2 --collect-all onnxruntime --collect-all av --collect-all tokenizers --collect-all certifi --collect-all huggingface_hub --collect-all nvidia.cublas --collect-all nvidia.cudnn sbobinatore_ai.py
+          pyinstaller --noconsole --onedir --name SbobinaFacile --collect-all customtkinter --collect-all faster_whisper --collect-all ctranslate2 --collect-all onnxruntime --collect-all av --collect-all tokenizers --collect-all certifi --collect-all huggingface_hub sbobinatore_ai.py
 
       - name: Scarica motore AI locale Vulkan (llama.cpp)
         shell: pwsh
@@ -48,12 +48,7 @@ jobs:
               if ($asset) { break }
             }
           }
-          if (-not $asset) {
-            Write-Host "File trovati nell'ultima release:"
-            $releases[0].assets | ForEach-Object { Write-Host $_.name }
-            throw "Nessun binario Windows trovato nelle ultime 15 release."
-          }
-          Write-Host "Scarico: $($asset.name)"
+          if (-not $asset) { throw "Nessun binario Windows trovato." }
           Invoke-WebRequest $asset.browser_download_url -OutFile llama.zip
           Expand-Archive llama.zip -DestinationPath "dist\SbobinaFacile\llama_bin" -Force
 
