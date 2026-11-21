@@ -3,20 +3,39 @@ import sys
 import json
 import time
 import queue
+import socket
+import itertools
 import threading
+import subprocess
 import webbrowser
 import requests
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
-from faster_whisper import WhisperModel
 
-# Evita crash su tqdm/huggingface quando compilato con --noconsole
+# Aggiunge le DLL CUDA di NVIDIA incluse nel pacchetto prima di importare faster_whisper
+if getattr(sys, "frozen", False):
+    _base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    for _sub in (
+        os.path.join(_base, "nvidia", "cublas", "bin"),
+        os.path.join(_base, "nvidia", "cudnn", "bin"),
+    ):
+        if os.path.isdir(_sub):
+            os.add_dll_directory(_sub)
+            os.environ["PATH"] = _sub + os.pathsep + os.environ.get("PATH", "")
+
 if sys.stdout is None:
     sys.stdout = open(os.devnull, "w", encoding="utf-8")
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
-# Cartella dati utente scrivibile anche senza permessi Admin
+from faster_whisper import WhisperModel
+from huggingface_hub import hf_hub_download
+
+if getattr(sys, "frozen", False):
+    APP_BIN_DIR = os.path.dirname(sys.executable)
+else:
+    APP_BIN_DIR = os.path.dirname(os.path.abspath(__file__))
+
 DATA_DIR = os.path.join(
     os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
     "SbobinaFacile",
@@ -27,11 +46,13 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 MODELS_DIR = os.path.join(DATA_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
+LOCAL_LLM_REPO = "Qwen/Qwen2.5-3B-Instruct-GGUF"
+LOCAL_LLM_FILE = "qwen2.5-3b-instruct-q4_k_m.gguf"
+
 DEFAULT_CONFIG = {
     "ai_provider": "Gemini (Gratis Online)",
     "gemini_key": "",
     "gemini_model": "gemini-2.5-flash",
-    "ollama_model": "llama3.2",
     "quality": "Bilanciata",
     "language": "Italiano",
     "appearance": "Sistema",
@@ -101,13 +122,29 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
     return chunks
 
 
+def find_llama_server() -> str | None:
+    search_root = os.path.join(APP_BIN_DIR, "llama_bin")
+    if not os.path.isdir(search_root):
+        return None
+    for root_dir, _dirs, files in os.walk(search_root):
+        if "llama-server.exe" in files:
+            return os.path.join(root_dir, "llama-server.exe")
+    return None
+
+
+def get_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 class SettingsWindow(ctk.CTkToplevel):
     def __init__(self, parent, config: dict, on_save, first_run: bool = False):
         super().__init__(parent)
         self.title(
             "Benvenuto! Configurazione Iniziale" if first_run else "Impostazioni AI e Aspetto"
         )
-        self.geometry("500x520" if first_run else "500x450")
+        self.geometry("510x540" if first_run else "510x455")
         self.resizable(False, False)
         self.config = config
         self.on_save = on_save
@@ -124,15 +161,16 @@ class SettingsWindow(ctk.CTkToplevel):
             ctk.CTkLabel(
                 banner,
                 text="Prima installazione rilevata!\n"
-                "Per generare i riassunti gratis, incolla qui sotto la tua chiave API di Google Gemini.\n"
-                "Puoi ottenerla gratis in 30 secondi cliccando il pulsante qui sotto.",
+                "• Con Google Gemini: veloce e gratis online (incolla la tua chiave API).\n"
+                "• Con AI Locale Integrata: tutto offline sul tuo PC usando la scheda video\n"
+                "  (nessuna chiave richiesta; scaricherà ~2 GB al primo riassunto).",
                 font=ctk.CTkFont(size=12),
                 justify="left",
             ).pack(anchor="w", padx=12, pady=10)
 
         ctk.CTkLabel(
             frame,
-            text="Configurazione Motore Riassunti AI",
+            text="Motore per i Riassunti AI",
             font=ctk.CTkFont(size=16, weight="bold"),
         ).pack(anchor="w", padx=16, pady=(10, 6))
 
@@ -142,10 +180,10 @@ class SettingsWindow(ctk.CTkToplevel):
             variable=self.provider_var,
             values=[
                 "Gemini (Gratis Online)",
-                "Ollama (Gratis Offline)",
+                "AI Locale Integrata (Offline, Gratis)",
                 "Disattivato (Solo trascrizione)",
             ],
-            width=320,
+            width=340,
             command=self._toggle_fields,
         )
         self.provider_menu.pack(anchor="w", padx=16, pady=(0, 12))
@@ -169,13 +207,13 @@ class SettingsWindow(ctk.CTkToplevel):
         self.btn_get_key.pack(side="right")
 
         self.gemini_entry = ctk.CTkEntry(
-            frame, placeholder_text="Incolla qui la chiave (es. AIzaSy...)", show="*", width=430
+            frame, placeholder_text="Incolla qui la chiave (es. AIzaSy...)", show="*", width=440
         )
         self.gemini_entry.insert(0, config.get("gemini_key", ""))
         self.gemini_entry.pack(anchor="w", padx=16, pady=(6, 12))
 
         ctk.CTkLabel(
-            frame, text="Nome modello AI:", font=ctk.CTkFont(size=12, weight="bold")
+            frame, text="Modello Gemini (opzionale):", font=ctk.CTkFont(size=12, weight="bold")
         ).pack(anchor="w", padx=16)
         self.model_entry = ctk.CTkEntry(frame, width=260)
         self.model_entry.pack(anchor="w", padx=16, pady=(4, 12))
@@ -209,11 +247,11 @@ class SettingsWindow(ctk.CTkToplevel):
             self.btn_get_key.configure(state="normal")
             self.model_entry.configure(state="normal")
             self.model_entry.insert(0, self.config.get("gemini_model", "gemini-2.5-flash"))
-        elif "Ollama" in choice:
+        elif "Locale" in choice:
             self.gemini_entry.configure(state="disabled")
             self.btn_get_key.configure(state="disabled")
-            self.model_entry.configure(state="normal")
-            self.model_entry.insert(0, self.config.get("ollama_model", "llama3.2"))
+            self.model_entry.insert(0, "Qwen 2.5 3B (Integrato)")
+            self.model_entry.configure(state="disabled")
         else:
             self.gemini_entry.configure(state="disabled")
             self.btn_get_key.configure(state="disabled")
@@ -226,7 +264,7 @@ class SettingsWindow(ctk.CTkToplevel):
         if "Gemini" in provider and not key:
             messagebox.showwarning(
                 "Chiave mancante",
-                "Incolla la chiave API di Google Gemini oppure scegli 'Disattivato' / 'Ollama' dal menu.",
+                "Incolla la chiave API di Google Gemini oppure scegli 'AI Locale Integrata' dal menu.",
                 parent=self,
             )
             return
@@ -235,8 +273,6 @@ class SettingsWindow(ctk.CTkToplevel):
         self.config["gemini_key"] = key
         if "Gemini" in provider and self.model_entry.get().strip():
             self.config["gemini_model"] = self.model_entry.get().strip()
-        elif "Ollama" in provider and self.model_entry.get().strip():
-            self.config["ollama_model"] = self.model_entry.get().strip()
         self.config["appearance"] = self.theme_var.get()
 
         save_config(self.config)
@@ -259,10 +295,16 @@ class SbobinaFacileApp(ctk.CTk):
         self.selected_file = ""
         self.last_output_dir = ""
         self.stop_requested = False
+        self.llama_proc = None
 
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
         self.after(100, self._process_queue)
         self.after(300, self._check_first_run)
+
+    def _on_close(self):
+        self._stop_local_llm()
+        self.destroy()
 
     def _apply_theme(self, choice: str):
         mapping = {"Sistema": "System", "Chiaro": "Light", "Scuro": "Dark"}
@@ -559,7 +601,7 @@ class SbobinaFacileApp(ctk.CTk):
 
     def _pick_and_summarize_txt(self):
         if "Disattivato" in self.config_data.get("ai_provider", ""):
-            messagebox.showinfo("AI disattivata", "Attiva Gemini o Ollama nelle Impostazioni per usare i riassunti.")
+            messagebox.showinfo("AI disattivata", "Attiva Gemini o AI Locale nelle Impostazioni per i riassunti.")
             return
         if not self._check_ai_ready():
             return
@@ -584,11 +626,36 @@ class SbobinaFacileApp(ctk.CTk):
             daemon=True,
         ).start()
 
-    def _load_whisper(self, model_size: str) -> WhisperModel:
+    def _start_whisper_with_fallback(self, file_path: str, model_size: str, lang: str | None):
+        # Prova prima con GPU NVIDIA (CUDA) fino al primo segmento reale
         try:
-            return WhisperModel(model_size, device="cuda", compute_type="float16", download_root=MODELS_DIR)
+            self.ui_queue.put(("status", "Avvio motore vocale (provo accelerazione GPU NVIDIA)..."))
+            model = WhisperModel(
+                model_size, device="cuda", compute_type="float16", download_root=MODELS_DIR
+            )
+            segments, info = model.transcribe(
+                file_path,
+                language=lang,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+            )
+            seg_iter = iter(segments)
+            first_seg = next(seg_iter, None)
+            return "🚀 GPU NVIDIA", info, first_seg, seg_iter
         except Exception:
-            return WhisperModel(model_size, device="cpu", compute_type="int8", download_root=MODELS_DIR)
+            self.ui_queue.put(("status", "Avvio motore vocale su processore (CPU)..."))
+            model = WhisperModel(
+                model_size, device="cpu", compute_type="int8", download_root=MODELS_DIR
+            )
+            segments, info = model.transcribe(
+                file_path,
+                language=lang,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+            )
+            seg_iter = iter(segments)
+            first_seg = next(seg_iter, None)
+            return "💻 CPU", info, first_seg, seg_iter
 
     def _worker_full(self, file_path: str, do_summary: bool):
         try:
@@ -596,17 +663,12 @@ class SbobinaFacileApp(ctk.CTk):
             lang_code = LANG_MAP.get(self.lang_menu.get(), "it")
             lang = None if lang_code == "auto" else lang_code
 
-            self.ui_queue.put(("status", "Preparazione del motore vocale (al primo avvio scarica il modello, attendi 1-2 min)..."))
-            model = self._load_whisper(model_size)
-
-            self.ui_queue.put(("status", "Analisi dell'audio in corso..."))
-            segments, info = model.transcribe(
-                file_path,
-                language=lang,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
+            self.ui_queue.put(("status", "Preparazione del motore vocale (al primo avvio scarica il modello)..."))
+            hw_label, info, first_seg, seg_iter = self._start_whisper_with_fallback(
+                file_path, model_size, lang
             )
 
+            all_segs = itertools.chain([first_seg], seg_iter) if first_seg is not None else []
             total_dur = info.duration or 1.0
             base_path = os.path.splitext(file_path)[0]
             txt_path = f"{base_path}_trascrizione.txt"
@@ -614,7 +676,7 @@ class SbobinaFacileApp(ctk.CTk):
             t_start = time.time()
 
             with open(txt_path, "w", encoding="utf-8") as f:
-                for seg in segments:
+                for seg in all_segs:
                     if self.stop_requested:
                         break
                     line = f"[{format_timestamp(seg.start)}] {seg.text.strip()}\n"
@@ -627,13 +689,13 @@ class SbobinaFacileApp(ctk.CTk):
                     if ratio > 0.02:
                         elapsed = time.time() - t_start
                         eta_sec = (elapsed / ratio) - elapsed
-                        eta_txt = f" — Tempo stimato rimasto: {format_eta(eta_sec)}"
+                        eta_txt = f" — Rimasti {format_eta(eta_sec)}"
 
                     self.ui_queue.put(("transcript", line))
                     self.ui_queue.put(("progress", ratio))
                     self.ui_queue.put((
                         "status",
-                        f"Sto trascrivendo... {ratio*100:.0f}% ({format_timestamp(seg.end)} su {format_timestamp(total_dur)}){eta_txt}",
+                        f"[{hw_label}] Trascrizione: {ratio*100:.0f}% ({format_timestamp(seg.end)} / {format_timestamp(total_dur)}){eta_txt}",
                     ))
 
             self.ui_queue.put(("enable_folder", None))
@@ -647,7 +709,7 @@ class SbobinaFacileApp(ctk.CTk):
             if do_summary and parts:
                 self._run_summary("".join(parts), base_path)
             else:
-                self.ui_queue.put(("status", "✅ Completato! File salvato nella stessa cartella dell'originale."))
+                self.ui_queue.put(("status", f"✅ Completato ({hw_label})! File salvato nella stessa cartella."))
 
         except Exception as e:
             self.ui_queue.put(("error", self._humanize_error(e)))
@@ -666,18 +728,86 @@ class SbobinaFacileApp(ctk.CTk):
         finally:
             self.ui_queue.put(("done", None))
 
-    def _call_ai(self, prompt: str) -> str:
-        provider = self.config_data.get("ai_provider", "")
-        if "Ollama" in provider:
-            model = self.config_data.get("ollama_model", "llama3.2")
-            resp = requests.post(
-                "http://localhost:11434/api/generate",
-                json={"model": model, "prompt": prompt, "stream": False},
-                timeout=300,
+    def _ensure_local_llm(self) -> int:
+        server_exe = find_llama_server()
+        if not server_exe:
+            raise RuntimeError("Motore AI locale (llama-server.exe) non trovato nel pacchetto.")
+
+        model_path = os.path.join(MODELS_DIR, LOCAL_LLM_FILE)
+        if not os.path.isfile(model_path):
+            self.ui_queue.put(("status", "Primo avvio offline: scarico il modello AI locale (~2 GB), attendi..."))
+            model_path = hf_hub_download(
+                repo_id=LOCAL_LLM_REPO,
+                filename=LOCAL_LLM_FILE,
+                local_dir=MODELS_DIR,
             )
+
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # Prova prima con GPU Vulkan (-ngl 99), se fallisce passa a solo CPU (-ngl 0)
+        for ngl in (99, 0):
+            port = get_free_port()
+            cmd = [
+                server_exe,
+                "-m", model_path,
+                "--host", "127.0.0.1",
+                "--port", str(port),
+                "-c", "8192",
+                "-ngl", str(ngl),
+            ]
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creation_flags,
+            )
+            self.llama_proc = proc
+
+            ready = False
+            for _ in range(60):
+                if proc.poll() is not None:
+                    break
+                try:
+                    r = requests.get(f"http://127.0.0.1:{port}/health", timeout=1)
+                    if r.status_code == 200:
+                        ready = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+
+            if ready:
+                mode = "GPU Vulkan" if ngl > 0 else "CPU"
+                self.ui_queue.put(("status", f"AI locale pronta ({mode}). Generazione riassunto in corso..."))
+                return port
+
+            self._stop_local_llm()
+
+        raise RuntimeError("Impossibile avviare il motore AI locale integrato.")
+
+    def _stop_local_llm(self):
+        if self.llama_proc is not None:
+            try:
+                self.llama_proc.terminate()
+                self.llama_proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self.llama_proc.kill()
+                except Exception:
+                    pass
+            self.llama_proc = None
+
+    def _call_ai(self, prompt: str, local_port: int | None = None) -> str:
+        provider = self.config_data.get("ai_provider", "")
+        if "Locale" in provider:
+            url = f"http://127.0.0.1:{local_port}/v1/chat/completions"
+            payload = {
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+            }
+            resp = requests.post(url, json=payload, timeout=300)
             if resp.status_code != 200:
-                raise RuntimeError(f"Ollama ha risposto con errore {resp.status_code}")
-            return resp.json().get("response", "").strip()
+                raise RuntimeError(f"Errore AI locale ({resp.status_code}): {resp.text}")
+            return resp.json()["choices"][0]["message"]["content"].strip()
 
         elif "Gemini" in provider:
             model = self.config_data.get("gemini_model", "gemini-2.5-flash")
@@ -696,60 +826,65 @@ class SbobinaFacileApp(ctk.CTk):
 
     def _run_summary(self, full_text: str, base_path: str):
         provider = self.config_data.get("ai_provider", "")
-        self.ui_queue.put(("status", "Sto leggendo la trascrizione per preparare il riassunto AI..."))
+        self.ui_queue.put(("status", "Preparazione del riassunto AI..."))
         self.ui_queue.put(("switch_tab", "✨ Riassunto"))
 
-        max_chars = 350000 if "Gemini" in provider else 10000
-        chunks = chunk_text(full_text, max_chars=max_chars)
+        local_port = None
+        try:
+            if "Locale" in provider:
+                local_port = self._ensure_local_llm()
 
-        if len(chunks) == 1:
-            prompt = (
-                "Analizza questa trascrizione in italiano e scrivi un riassunto chiaro, ordinato e facile da leggere "
-                "(usa titoli in maiuscolo e semplici elenchi con il simbolo •, evita codici markdown complessi).\n"
-                "Includi:\n"
-                "1. SINTESI GENERALE\n"
-                "2. PUNTI CHIAVE E ARGOMENTI TRATTATI\n"
-                "3. CONCLUSIONI O DECISIONI IMPORTANTI\n\n"
-                f"TRASCRIZIONE:\n{chunks[0]}"
-            )
-            final_summary = self._call_ai(prompt)
-        else:
-            partials = []
-            for idx, ch in enumerate(chunks, start=1):
-                if self.stop_requested:
-                    return
-                self.ui_queue.put(("status", f"Riassumo la parte {idx} di {len(chunks)}..."))
-                self.ui_queue.put(("progress", idx / (len(chunks) + 1)))
-                p = (
-                    f"Riassumi in modo fedele e completo questa parte ({idx}/{len(chunks)}) "
-                    f"di una lunga trascrizione in italiano, mantenendo nomi e concetti chiave:\n\n{ch}"
+            max_chars = 350000 if "Gemini" in provider else 10000
+            chunks = chunk_text(full_text, max_chars=max_chars)
+
+            if len(chunks) == 1:
+                prompt = (
+                    "Analizza questa trascrizione in italiano e scrivi un riassunto chiaro, ordinato e facile da leggere "
+                    "(usa titoli in maiuscolo e semplici elenchi con il simbolo •, evita codici markdown complessi).\n"
+                    "Includi:\n"
+                    "1. SINTESI GENERALE\n"
+                    "2. PUNTI CHIAVE E ARGOMENTI TRATTATI\n"
+                    "3. CONCLUSIONI O DECISIONI IMPORTANTI\n\n"
+                    f"TRASCRIZIONE:\n{chunks[0]}"
                 )
-                partials.append(self._call_ai(p))
+                final_summary = self._call_ai(prompt, local_port)
+            else:
+                partials = []
+                for idx, ch in enumerate(chunks, start=1):
+                    if self.stop_requested:
+                        return
+                    self.ui_queue.put(("status", f"Riassumo la parte {idx} di {len(chunks)}..."))
+                    self.ui_queue.put(("progress", idx / (len(chunks) + 1)))
+                    p = (
+                        f"Riassumi in modo fedele e completo questa parte ({idx}/{len(chunks)}) "
+                        f"di una lunga trascrizione in italiano, mantenendo nomi e concetti chiave:\n\n{ch}"
+                    )
+                    partials.append(self._call_ai(p, local_port))
 
-            self.ui_queue.put(("status", "Unisco tutto nel riassunto finale..."))
-            combined = "\n\n---\n\n".join(partials)
-            final_prompt = (
-                "Unisci questi riassunti parziali in un unico riassunto finale ordinato e facile da leggere in italiano "
-                "(usa titoli in maiuscolo ed elenchi con •):\n"
-                "1. SINTESI GENERALE\n"
-                "2. PUNTI CHIAVE PER ARGOMENTO\n"
-                "3. CONCLUSIONI\n\n"
-                f"{combined}"
-            )
-            final_summary = self._call_ai(final_prompt)
+                self.ui_queue.put(("status", "Unisco tutto nel riassunto finale..."))
+                combined = "\n\n---\n\n".join(partials)
+                final_prompt = (
+                    "Unisci questi riassunti parziali in un unico riassunto finale ordinato e facile da leggere in italiano "
+                    "(usa titoli in maiuscolo ed elenchi con •):\n"
+                    "1. SINTESI GENERALE\n"
+                    "2. PUNTI CHIAVE PER ARGOMENTO\n"
+                    "3. CONCLUSIONI\n\n"
+                    f"{combined}"
+                )
+                final_summary = self._call_ai(final_prompt, local_port)
 
-        summary_path = f"{base_path}_riassunto.txt"
-        with open(summary_path, "w", encoding="utf-8") as f:
-            f.write(final_summary)
+            summary_path = f"{base_path}_riassunto.txt"
+            with open(summary_path, "w", encoding="utf-8") as f:
+                f.write(final_summary)
 
-        self.ui_queue.put(("progress", 1.0))
-        self.ui_queue.put(("summary", final_summary))
-        self.ui_queue.put(("status", "✅ Tutto pronto! Trascrizione e riassunto salvati nella cartella del file."))
+            self.ui_queue.put(("progress", 1.0))
+            self.ui_queue.put(("summary", final_summary))
+            self.ui_queue.put(("status", "✅ Tutto pronto! Trascrizione e riassunto salvati nella cartella del file."))
+        finally:
+            self._stop_local_llm()
 
     def _humanize_error(self, err: Exception) -> str:
         msg = str(err)
-        if "11434" in msg or "ConnectionError" in msg:
-            return "Non riesco a collegarmi a Ollama. Assicurati che Ollama sia aperto sul PC (o passa a Gemini nelle Impostazioni)."
         if "API_KEY_INVALID" in msg or "400" in msg or "403" in msg:
             return "La chiave API di Google Gemini sembra non valida. Controllala cliccando su ⚙️ Impostazioni."
         return f"Si è verificato un imprevisto:\n{msg}"
