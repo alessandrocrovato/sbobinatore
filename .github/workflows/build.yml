@@ -1,0 +1,43 @@
+name: Build SbobinaFacile Installer
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Scarica i file del repository
+        uses: actions/checkout@v4
+
+      - name: Configura Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installa dipendenze e PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install faster-whisper requests customtkinter pyinstaller certifi
+
+      - name: Compila eseguibile con PyInstaller
+        run: |
+          pyinstaller --noconsole --onedir --name SbobinaFacile --collect-all customtkinter --collect-all faster_whisper --collect-all ctranslate2 --collect-all onnxruntime --collect-all av --collect-all tokenizers --collect-all certifi sbobinatore_ai.py
+
+      - name: Crea Setup.exe con Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y
+          }
+          & $iscc installer.iss
+
+      - name: Carica installer pronto per il download
+        uses: actions/upload-artifact@v4
+        with:
+          name: Setup_SbobinaFacile
+          path: installer_output/Setup_SbobinaFacile_v1.0.exe
