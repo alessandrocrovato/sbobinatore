@@ -18,14 +18,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Installa dipendenze e PyInstaller
+      - name: Installa dipendenze, librerie GPU NVIDIA e PyInstaller
         run: |
           python -m pip install --upgrade pip
-          pip install faster-whisper requests customtkinter pyinstaller certifi
+          pip install faster-whisper requests customtkinter pyinstaller certifi nvidia-cublas-cu12 nvidia-cudnn-cu12
 
       - name: Compila eseguibile con PyInstaller
         run: |
-          pyinstaller --noconsole --onedir --name SbobinaFacile --collect-all customtkinter --collect-all faster_whisper --collect-all ctranslate2 --collect-all onnxruntime --collect-all av --collect-all tokenizers --collect-all certifi sbobinatore_ai.py
+          pyinstaller --noconsole --onedir --name SbobinaFacile --collect-all customtkinter --collect-all faster_whisper --collect-all ctranslate2 --collect-all onnxruntime --collect-all av --collect-all tokenizers --collect-all certifi --collect-all huggingface_hub --collect-all nvidia.cublas --collect-all nvidia.cudnn sbobinatore_ai.py
+
+      - name: Scarica motore AI locale Vulkan (llama.cpp)
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+          $asset = $rel.assets | Where-Object { $_.name -like "*bin-win-vulkan-x64.zip" } | Select-Object -First 1
+          if (-not $asset) {
+            $asset = $rel.assets | Where-Object { $_.name -like "*bin-win-cpu-x64.zip" } | Select-Object -First 1
+          }
+          Invoke-WebRequest $asset.browser_download_url -OutFile llama.zip
+          Expand-Archive llama.zip -DestinationPath "dist\SbobinaFacile\llama_bin" -Force
 
       - name: Crea Setup.exe con Inno Setup
         shell: pwsh
